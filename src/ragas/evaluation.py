@@ -5,11 +5,14 @@ from dataclasses import dataclass, field
 
 import numpy as np
 from datasets import Dataset, concatenate_datasets
+from langchain_core.callbacks import BaseCallbackHandler, BaseCallbackManager
 from langchain_core.embeddings import Embeddings as LangchainEmbeddings
 from langchain_core.language_models import BaseLanguageModel as LangchainLLM
 
-from ragas._analytics import EvaluationEvent, track
+from ragas._analytics import EvaluationEvent, track, track_was_completed
 from ragas.callbacks import new_group
+from ragas.cost import TokenUsage
+from ragas.dataset_schema import EvaluationDataset, MultiTurnSample, SingleTurnSample
 from ragas.embeddings.base import (
     BaseRagasEmbeddings,
     LangchainEmbeddingsWrapper,
@@ -17,35 +20,51 @@ from ragas.embeddings.base import (
 )
 from ragas.exceptions import ExceptionInRunner
 from ragas.executor import Executor
+from ragas.integrations.helicone import helicone_config
 from ragas.llms import llm_factory
 from ragas.llms.base import BaseRagasLLM, LangchainLLMWrapper
 from ragas.metrics._answer_correctness import AnswerCorrectness
-from ragas.metrics.base import Metric, MetricWithEmbeddings, MetricWithLLM
+from ragas.metrics.base import (
+    Metric,
+    MetricWithEmbeddings,
+    MetricWithLLM,
+    MultiTurnMetric,
+    SingleTurnMetric,
+    is_reproducable,
+)
 from ragas.metrics.critique import AspectCritique
 from ragas.run_config import RunConfig
-from ragas.utils import get_feature_language
-
-# from ragas.metrics.critique import AspectCritique
+from ragas.utils import (
+    convert_v1_to_v2_dataset,
+    convert_v2_to_v1_dataset,
+    get_feature_language,
+    safe_nanmean,
+)
 from ragas.validation import (
-    handle_deprecated_ground_truths,
     remap_column_names,
-    validate_column_dtypes,
-    validate_evaluation_modes,
+    validate_required_columns,
+    validate_supported_metrics,
 )
 
 if t.TYPE_CHECKING:
     from langchain_core.callbacks import Callbacks
 
+    from ragas.cost import CostCallbackHandler, TokenUsageParser
 
+RAGAS_EVALUATION_CHAIN_NAME = "ragas evaluation"
+
+
+@track_was_completed
 def evaluate(
-    dataset: Dataset,
+    dataset: t.Union[Dataset, EvaluationDataset],
     metrics: list[Metric] | None = None,
     llm: t.Optional[BaseRagasLLM | LangchainLLM] = None,
     embeddings: t.Optional[BaseRagasEmbeddings | LangchainEmbeddings] = None,
     callbacks: Callbacks = None,
-    is_async: bool = False,
-    run_config: t.Optional[RunConfig] = None,
-    raise_exceptions: bool = True,
+    in_ci: bool = False,
+    run_config: RunConfig = RunConfig(),
+    token_usage_parser: t.Optional[TokenUsageParser] = None,
+    raise_exceptions: bool = False,
     column_map: t.Optional[t.Dict[str, str]] = None,
 ) -> Result:
     """
@@ -71,18 +90,20 @@ def evaluate(
         Lifecycle Langchain Callbacks to run during evaluation. Check the
         [langchain documentation](https://python.langchain.com/docs/modules/callbacks/)
         for more information.
-    is_async: bool, optional
-        Whether to run the evaluation in async mode or not. If set to True then the
-        evaluation is run by calling the `metric.ascore` method. In case the llm or
-        embeddings does not support async then the evaluation can be run in sync mode
-        with `is_async=False`. Default is False.
+    in_ci: bool
+        Whether the evaluation is running in CI or not. If set to True then some
+        metrics will be run to increase the reproducability of the evaluations. This
+        will increase the runtime and cost of evaluations. Default is False.
     run_config: RunConfig, optional
         Configuration for runtime settings like timeout and retries. If not provided,
         default values are used.
-    raise_exceptions: True
+    token_usage_parser: TokenUsageParser, optional
+        Parser to get the token usage from the LLM result. If not provided then the
+        the cost and total tokens will not be calculated. Default is None.
+    raise_exceptions: False
         Whether to raise exceptions or not. If set to True then the evaluation will
         raise an exception if any of the metrics fail. If set to False then the
-        evaluation will return `np.nan` for the row that failed. Default is True.
+        evaluation will return `np.nan` for the row that failed. Default is False.
     column_map : dict[str, str], optional
         The column names of the dataset to use for evaluation. If the column names of
         the dataset are different from the default ones then you can provide the
@@ -123,11 +144,15 @@ def evaluate(
     column_map = column_map or {}
     callbacks = callbacks or []
 
+    if helicone_config.is_enabled:
+        import uuid
+
+        helicone_config.session_name = "ragas-evaluation"
+        helicone_config.session_id = str(uuid.uuid4())
+
     if dataset is None:
         raise ValueError("Provide dataset!")
 
-    # default run_config
-    run_config = run_config or RunConfig()
     # default metrics
     if metrics is None:
         from ragas.metrics import (
@@ -139,12 +164,18 @@ def evaluate(
 
         metrics = [answer_relevancy, context_precision, faithfulness, context_recall]
 
-    # remap column names from the dataset
-    dataset = remap_column_names(dataset, column_map)
-    # validation
-    dataset = handle_deprecated_ground_truths(dataset)
-    validate_evaluation_modes(dataset, metrics)
-    validate_column_dtypes(dataset)
+    v1_input = False
+    if isinstance(dataset, Dataset):
+        # remap column names from the dataset
+        v1_input = True
+        dataset = remap_column_names(dataset, column_map)
+        dataset = convert_v1_to_v2_dataset(dataset)
+        # validation
+        dataset = EvaluationDataset.from_list(dataset.to_list())
+
+    if isinstance(dataset, EvaluationDataset):
+        validate_required_columns(dataset, metrics)
+        validate_supported_metrics(dataset, metrics)
 
     # set the llm and embeddings
     if isinstance(llm, LangchainLLM):
@@ -156,9 +187,12 @@ def evaluate(
     binary_metrics = []
     llm_changed: t.List[int] = []
     embeddings_changed: t.List[int] = []
+    reproducable_metrics: t.List[int] = []
     answer_correctness_is_set = -1
 
+    # loop through the metrics and perform initializations
     for i, metric in enumerate(metrics):
+        # set llm and embeddings if not set
         if isinstance(metric, AspectCritique):
             binary_metrics.append(metric.name)
         if isinstance(metric, MetricWithLLM) and metric.llm is None:
@@ -174,9 +208,15 @@ def evaluate(
         if isinstance(metric, AnswerCorrectness):
             if metric.answer_similarity is None:
                 answer_correctness_is_set = i
+        # set reproducibility for metrics if in CI
+        if in_ci and is_reproducable(metric):
+            if metric.reproducibility == 1:  # type: ignore
+                # only set a value if not already set
+                metric.reproducibility = 3  # type: ignore
+                reproducable_metrics.append(i)
 
-    # initialize all the models in the metrics
-    [m.init(run_config) for m in metrics]
+        # init all the models
+        metric.init(run_config)
 
     executor = Executor(
         desc="Evaluating",
@@ -184,26 +224,66 @@ def evaluate(
         raise_exceptions=raise_exceptions,
         run_config=run_config,
     )
+
+    # Ragas Callbacks
+    # init the callbacks we need for various tasks
+    ragas_callbacks: t.Dict[str, BaseCallbackHandler] = {}
+
+    # check if cost needs to be calculated
+    if token_usage_parser is not None:
+        from ragas.cost import CostCallbackHandler
+
+        cost_cb = CostCallbackHandler(token_usage_parser=token_usage_parser)
+        ragas_callbacks["cost_cb"] = cost_cb
+
+    # append all the ragas_callbacks to the callbacks
+    for cb in ragas_callbacks.values():
+        if isinstance(callbacks, BaseCallbackManager):
+            callbacks.add_handler(cb)
+        else:
+            callbacks.append(cb)
+
     # new evaluation chain
     row_run_managers = []
     evaluation_rm, evaluation_group_cm = new_group(
-        name="ragas evaluation", inputs={}, callbacks=callbacks, is_async=is_async
+        name=RAGAS_EVALUATION_CHAIN_NAME, inputs={}, callbacks=callbacks
     )
-    for i, row in enumerate(dataset):
-        row = t.cast(t.Dict[str, t.Any], row)
+
+    sample_type = dataset.get_sample_type()
+    for i, sample in enumerate(dataset):
+        row = t.cast(t.Dict[str, t.Any], sample.dict())
         row_rm, row_group_cm = new_group(
             name=f"row {i}",
             inputs=row,
             callbacks=evaluation_group_cm,
-            is_async=is_async,
         )
         row_run_managers.append((row_rm, row_group_cm))
-        [
-            executor.submit(
-                metric.ascore, row, row_group_cm, is_async, name=f"{metric.name}-{i}"
-            )
-            for metric in metrics
-        ]
+        if sample_type == SingleTurnSample:
+            _ = [
+                executor.submit(
+                    metric.single_turn_ascore,
+                    sample,
+                    row_group_cm,
+                    name=f"{metric.name}-{i}",
+                    timeout=run_config.timeout,
+                )
+                for metric in metrics
+                if isinstance(metric, SingleTurnMetric)
+            ]
+        elif sample_type == MultiTurnSample:
+            _ = [
+                executor.submit(
+                    metric.multi_turn_ascore,
+                    sample,
+                    row_group_cm,
+                    name=f"{metric.name}-{i}",
+                    timeout=run_config.timeout,
+                )
+                for metric in metrics
+                if isinstance(metric, MultiTurnMetric)
+            ]
+        else:
+            raise ValueError(f"Unsupported sample type {sample_type}")
 
     scores = []
     try:
@@ -230,10 +310,22 @@ def evaluate(
 
         raise e
     else:
+        # evalution run was successful
+        # now lets process the results
+        # convert to v.1 dataset
+        dataset = dataset.to_hf_dataset()
+        if v1_input:
+            dataset = convert_v2_to_v1_dataset(dataset)
+
+        cost_cb = ragas_callbacks["cost_cb"] if "cost_cb" in ragas_callbacks else None
         result = Result(
             scores=Dataset.from_list(scores),
             dataset=dataset,
             binary_columns=binary_metrics,
+            cost_cb=t.cast(
+                t.Union["CostCallbackHandler", None],
+                cost_cb,
+            ),
         )
         if not evaluation_group_cm.ended:
             evaluation_rm.on_chain_end(result)
@@ -248,6 +340,9 @@ def evaluate(
                 AnswerCorrectness, metrics[answer_correctness_is_set]
             ).answer_similarity = None
 
+        for i in reproducable_metrics:
+            metrics[i].reproducibility = 1  # type: ignore
+
     # log the evaluation event
     metrics_names = [m.name for m in metrics]
     metric_lang = [get_feature_language(m) for m in metrics]
@@ -257,8 +352,9 @@ def evaluate(
             event_type="evaluation",
             metrics=metrics_names,
             evaluation_mode="",
-            num_rows=dataset.shape[0],
+            num_rows=len(dataset),
             language=metric_lang[0] if len(metric_lang) > 0 else "",
+            in_ci=in_ci,
         )
     )
     return result
@@ -269,11 +365,12 @@ class Result(dict):
     scores: Dataset
     dataset: t.Optional[Dataset] = None
     binary_columns: t.List[str] = field(default_factory=list)
+    cost_cb: t.Optional[CostCallbackHandler] = None
 
     def __post_init__(self):
         values = []
         for cn in self.scores[0].keys():
-            value = np.nanmean(self.scores[cn])
+            value = safe_nanmean(self.scores[cn])
             self[cn] = value
             if cn not in self.binary_columns:
                 value = t.cast(float, value)
@@ -286,6 +383,27 @@ class Result(dict):
         result_ds = concatenate_datasets([self.dataset, self.scores], axis=1)
 
         return result_ds.to_pandas(batch_size=batch_size, batched=batched)
+
+    def total_tokens(self) -> t.Union[t.List[TokenUsage], TokenUsage]:
+        if self.cost_cb is None:
+            raise ValueError(
+                "The evaluate() run was not configured for computing cost. Please provide a token_usage_parser function to evaluate() to compute cost."
+            )
+        return self.cost_cb.total_tokens()
+
+    def total_cost(
+        self,
+        cost_per_input_token: t.Optional[float] = None,
+        cost_per_output_token: t.Optional[float] = None,
+        per_model_costs: t.Dict[str, t.Tuple[float, float]] = {},
+    ) -> float:
+        if self.cost_cb is None:
+            raise ValueError(
+                "The evaluate() run was not configured for computing cost. Please provide a token_usage_parser function to evaluate() to compute cost."
+            )
+        return self.cost_cb.total_cost(
+            cost_per_input_token, cost_per_output_token, per_model_costs
+        )
 
     def __repr__(self) -> str:
         scores = self.copy()

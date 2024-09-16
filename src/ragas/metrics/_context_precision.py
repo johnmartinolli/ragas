@@ -5,12 +5,12 @@ import typing as t
 from dataclasses import dataclass, field
 
 import numpy as np
-from datasets import Dataset
 from langchain.pydantic_v1 import BaseModel, Field
 
+from ragas.dataset_schema import SingleTurnSample
 from ragas.llms.output_parser import RagasoutputParser, get_json_format_instructions
 from ragas.llms.prompt import Prompt, PromptValue
-from ragas.metrics.base import EvaluationMode, MetricWithLLM
+from ragas.metrics.base import MetricType, MetricWithLLM, SingleTurnMetric, ensembler
 
 if t.TYPE_CHECKING:
     from langchain_core.callbacks import Callbacks
@@ -74,7 +74,7 @@ CONTEXT_PRECISION = Prompt(
 
 
 @dataclass
-class ContextPrecision(MetricWithLLM):
+class ContextPrecision(MetricWithLLM, SingleTurnMetric):
     """
     Average Precision is a metric that evaluates whether all of the
     relevant items selected by the model are ranked higher or not.
@@ -87,19 +87,37 @@ class ContextPrecision(MetricWithLLM):
     """
 
     name: str = "context_precision"  # type: ignore
-    evaluation_mode: EvaluationMode = EvaluationMode.qcg  # type: ignore
+    _required_columns: t.Dict[MetricType, t.Set[str]] = field(
+        default_factory=lambda: {
+            MetricType.SINGLE_TURN: {
+                "user_input",
+                "retrieved_contexts",
+                "reference",
+            }
+        }
+    )
     context_precision_prompt: Prompt = field(default_factory=lambda: CONTEXT_PRECISION)
     max_retries: int = 1
+    _reproducibility: int = 1
+
+    @property
+    def reproducibility(self):
+        return self._reproducibility
+
+    @reproducibility.setter
+    def reproducibility(self, value):
+        if value < 1:
+            logger.warning("reproducibility cannot be less than 1, setting to 1")
+            value = 1
+        elif value % 2 == 0:
+            logger.warning(
+                "reproducibility level cannot be set to even number, setting to odd"
+            )
+            value += 1
+        self._reproducibility = value
 
     def _get_row_attributes(self, row: t.Dict) -> t.Tuple[str, t.List[str], t.Any]:
-        answer = "ground_truth"
-        if answer not in row.keys():
-            logger.warning(
-                "Using 'context_precision' without ground truth will be soon depreciated. Use 'context_utilization' instead"
-            )
-            answer = "answer"
-
-        return row["question"], row["contexts"], row[answer]
+        return row["user_input"], row["retrieved_contexts"], row["reference"]
 
     def _context_precision_prompt(self, row: t.Dict) -> t.List[PromptValue]:
         question, contexts, answer = self._get_row_attributes(row)
@@ -130,34 +148,44 @@ class ContextPrecision(MetricWithLLM):
             )
         return score
 
+    async def _single_turn_ascore(
+        self, sample: SingleTurnSample, callbacks: Callbacks
+    ) -> float:
+        row = sample.dict()
+        return await self._ascore(row, callbacks)
+
     async def _ascore(
         self: t.Self,
         row: t.Dict,
         callbacks: Callbacks,
-        is_async: bool,
     ) -> float:
         assert self.llm is not None, "LLM is not set"
 
         human_prompts = self._context_precision_prompt(row)
         responses = []
         for hp in human_prompts:
-            result = await self.llm.generate(
+            results = await self.llm.generate(
                 hp,
-                n=1,
                 callbacks=callbacks,
-                is_async=is_async,
+                n=self.reproducibility,
             )
-            responses.append([result.generations[0][0].text, hp])
+            results = [
+                await _output_parser.aparse(item.text, hp, self.llm, self.max_retries)
+                for item in results.generations[0]
+            ]
 
-        items = [
-            await _output_parser.aparse(item, hp, self.llm, self.max_retries)
-            for item, hp in responses
-        ]
-        if any(item is None for item in items):
-            return np.nan
+            responses.append(
+                [result.dict() for result in results if result is not None]
+            )
 
-        items = [item for item in items if item is not None]
-        answers = ContextPrecisionVerifications(__root__=items)
+        answers = []
+        for response in responses:
+            agg_answer = ensembler.from_discrete([response], "verdict")
+            if agg_answer:
+                agg_answer = ContextPrecisionVerification.parse_obj(agg_answer[0])
+            answers.append(agg_answer)
+
+        answers = ContextPrecisionVerifications(__root__=answers)
         score = self._calculate_average_precision(answers.__root__)
         return score
 
@@ -176,10 +204,14 @@ class ContextPrecision(MetricWithLLM):
 @dataclass
 class ContextUtilization(ContextPrecision):
     name: str = "context_utilization"
-    evaluation_mode: EvaluationMode = EvaluationMode.qac
+    _required_columns: t.Dict[MetricType, t.Set[str]] = field(
+        default_factory=lambda: {
+            MetricType.SINGLE_TURN: {"user_input", "response", "retreived_contexts"}
+        }
+    )
 
-    def get_dataset_attributes(self, dataset: Dataset):
-        return dataset["question"], dataset["contexts"], dataset["answer"]
+    def _get_row_attributes(self, row: t.Dict) -> t.Tuple[str, t.List[str], t.Any]:
+        return row["user_input"], row["retrieved_contexts"], row["response"]
 
 
 context_precision = ContextPrecision()

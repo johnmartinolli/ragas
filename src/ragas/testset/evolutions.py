@@ -25,7 +25,6 @@ from ragas.testset.prompts import (
     reasoning_question_prompt,
     seed_question_prompt,
 )
-from ragas.testset.utils import rng
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +103,8 @@ class Evolution:
             self.node_filter.set_run_config(run_config)
         if self.question_filter:
             self.question_filter.set_run_config(run_config)
+
+        self.run_config = run_config
 
     async def aretry_evolve(
         self,
@@ -202,7 +203,13 @@ class Evolution:
             if isinstance(relevant_contexts_result, dict)
             else None
         )
-        if relevant_context_indices is None:
+
+        if relevant_context_indices is not None:
+            relevant_context_indices = [
+                idx for idx in relevant_context_indices if isinstance(idx, int)
+            ]
+
+        if relevant_context_indices is None or not relevant_context_indices:
             relevant_context = CurrentNodes(
                 root_node=current_nodes.root_node, nodes=current_nodes.nodes
             )
@@ -270,6 +277,7 @@ class Evolution:
         assert self.question_filter is not None, "question_filter cannot be None"
         self.question_answer_prompt.save(cache_dir)
         self.find_relevant_context_prompt.save(cache_dir)
+        self.rewrite_invalid_question_prompt.save(cache_dir)
         self.node_filter.save(cache_dir)
         self.question_filter.save(cache_dir)
 
@@ -298,7 +306,9 @@ class SimpleEvolution(Evolution):
         results = await self.generator_llm.generate(
             prompt=self.seed_question_prompt.format(
                 context=merged_node.page_content,
-                keyphrase=rng.choice(np.array(merged_node.keyphrases), size=1)[0],
+                keyphrase=self.run_config.rng.choice(
+                    np.array(merged_node.keyphrases), size=1
+                )[0],
             )
         )
         seed_question = results.generations[0][0].text
@@ -346,14 +356,13 @@ class ComplexEvolution(Evolution):
             run_config = RunConfig()
         super().init(is_async=is_async, run_config=run_config)
 
-        if self.se is None:
-            # init simple evolution to get seed question
-            self.se = SimpleEvolution(
-                generator_llm=self.generator_llm,
-                docstore=self.docstore,
-                node_filter=self.node_filter,
-                question_filter=self.question_filter,
-            )
+        # init simple evolution to get seed question
+        self.se = SimpleEvolution(
+            generator_llm=self.generator_llm,
+            docstore=self.docstore,
+            node_filter=self.node_filter,
+            question_filter=self.question_filter,
+        )
         # init evolution filter with critic llm from another filter
         assert self.node_filter is not None, "node filter cannot be None"
         if self.evolution_filter is None:

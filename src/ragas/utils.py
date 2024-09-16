@@ -7,6 +7,7 @@ import warnings
 from functools import lru_cache
 
 import numpy as np
+from datasets import Dataset
 
 if t.TYPE_CHECKING:
     from ragas.metrics.base import Metric
@@ -30,6 +31,18 @@ def get_debug_mode() -> bool:
         return True
     else:
         return False
+
+
+def safe_nanmean(arr):
+    if len(arr) == 0:
+        return np.nan  # or some other value or behavior for empty arrays
+
+    arr = np.asarray(arr)  # Ensure input is a numpy array
+
+    if np.isnan(arr).all():
+        return np.nan  # or some other value or behavior for all-NaN arrays
+
+    return np.nanmean(arr)
 
 
 def check_if_sum_is_close(
@@ -144,3 +157,54 @@ def deprecated(
         return emit_warning
 
     return deprecate
+
+
+def get_or_init(
+    dictionary: t.Dict[str, t.Any], key: str, default: t.Callable[[], t.Any]
+) -> t.Any:
+    _value = dictionary.get(key)
+    value = _value if _value is not None else default()
+
+    return value
+
+
+def get_from_dict(data_dict: t.Dict, key: str, default=None) -> t.Any:
+    keys = key.split(".")
+    current = data_dict
+
+    for k in keys:
+        if isinstance(current, dict) and k in current:
+            current = current[k]
+        else:
+            return default
+
+    return current
+
+
+REQUIRED_COLS_v1 = {
+    "user_input": "question",
+    "retrieved_contexts": "contexts",
+    "response": "answer",
+    "reference": "ground_truth",
+}
+
+
+def get_required_columns_v1(metric: Metric):
+    required_cols = metric.required_columns.get("SINGLE_TURN", set())
+    required_cols = [REQUIRED_COLS_v1.get(col) for col in required_cols]
+    return [col for col in required_cols if col is not None]
+
+
+def convert_row_v1_to_v2(row: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
+    required_cols_v2 = {k: v for v, k in REQUIRED_COLS_v1.items()}
+    return {required_cols_v2[k]: v for k, v in row.items() if k in required_cols_v2}
+
+
+def convert_v1_to_v2_dataset(dataset: Dataset) -> Dataset:
+    columns_map = {v: k for k, v in REQUIRED_COLS_v1.items() if v in dataset.features}
+    return dataset.rename_columns(columns_map)
+
+
+def convert_v2_to_v1_dataset(dataset: Dataset) -> Dataset:
+    columns_map = {k: v for k, v in REQUIRED_COLS_v1.items() if k in dataset.features}
+    return dataset.rename_columns(columns_map)

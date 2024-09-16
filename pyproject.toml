@@ -18,6 +18,11 @@ dynamic = ["version", "readme"]
 [project.optional-dependencies]
 all = [
     "sentence-transformers",
+    "transformers",
+    "nltk",
+    "rouge_score",
+    "fuzzywuzzy",
+    "rapidfuzz",
 ]
 
 [tool.poetry]
@@ -31,6 +36,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.dynamic]
 readme = {file = ["README.md"], content-type = "text/plain"}
+
+[tool.ruff]
+exclude = ["*.ipynb"]
 
 [tool.ruff.lint]
 ignore = ["E501"]

@@ -3,6 +3,15 @@ from langchain_core.pydantic_v1 import BaseModel
 from ragas.llms.output_parser import RagasoutputParser, get_json_format_instructions
 from ragas.llms.prompt import Prompt
 
+
+class AnswerFormat(BaseModel):
+    answer: str
+    verdict: int
+
+
+question_answer_parser = RagasoutputParser(pydantic_object=AnswerFormat)
+
+
 reasoning_question_prompt = Prompt(
     name="reasoning_question",
     instruction="""Complicate the given question by rewriting question into a multi-hop reasoning question based on the provided context.
@@ -88,7 +97,6 @@ conditional_question_prompt = Prompt(
     language="english",
 )
 
-
 compress_question_prompt = Prompt(
     name="compress_question",
     instruction="""Rewrite the following question to make it more indirect and shorter while retaining the essence of the original question.
@@ -108,7 +116,6 @@ compress_question_prompt = Prompt(
     output_type="str",
     language="english",
 )
-
 
 conversational_question_prompt = Prompt(
     name="conversation_question",
@@ -133,34 +140,40 @@ conversational_question_prompt = Prompt(
     language="english",
 )
 
-
 question_answer_prompt = Prompt(
     name="answer_formulate",
     instruction="""Answer the question using the information from the given context. Output verdict as '1' if answer is present '-1' if answer is not present in the context.""",
+    output_format_instruction=get_json_format_instructions(AnswerFormat),
     examples=[
         {
             "context": """Climate change is significantly influenced by human activities, notably the emission of greenhouse gases from burning fossil fuels. The increased greenhouse gas concentration in the atmosphere traps more heat, leading to global warming and changes in weather patterns.""",
             "question": "How do human activities contribute to climate change?",
-            "answer": {
-                "answer": "Human activities contribute to climate change primarily through the emission of greenhouse gases from burning fossil fuels. These emissions increase the concentration of greenhouse gases in the atmosphere, which traps more heat and leads to global warming and altered weather patterns.",
-                "verdict": "1",
-            },
+            "answer": AnswerFormat.parse_obj(
+                {
+                    "answer": "Human activities contribute to climate change primarily through the emission of greenhouse gases from burning fossil fuels. These emissions increase the concentration of greenhouse gases in the atmosphere, which traps more heat and leads to global warming and altered weather patterns.",
+                    "verdict": "1",
+                }
+            ).dict(),
         },
         {
             "context": """The concept of artificial intelligence (AI) has evolved over time, but it fundamentally refers to machines designed to mimic human cognitive functions. AI can learn, reason, perceive, and, in some instances, react like humans, making it pivotal in fields ranging from healthcare to autonomous vehicles.""",
             "question": "What are the key capabilities of artificial intelligence?",
-            "answer": {
-                "answer": "Artificial intelligence is designed to mimic human cognitive functions, with key capabilities including learning, reasoning, perception, and reacting to the environment in a manner similar to humans. These capabilities make AI pivotal in various fields, including healthcare and autonomous driving.",
-                "verdict": "1",
-            },
+            "answer": AnswerFormat.parse_obj(
+                {
+                    "answer": "Artificial intelligence is designed to mimic human cognitive functions, with key capabilities including learning, reasoning, perception, and reacting to the environment in a manner similar to humans. These capabilities make AI pivotal in various fields, including healthcare and autonomous driving.",
+                    "verdict": "1",
+                }
+            ).dict(),
         },
         {
             "context": """The novel "Pride and Prejudice" by Jane Austen revolves around the character Elizabeth Bennet and her family. The story is set in the 19th century in rural England and deals with issues of marriage, morality, and misconceptions.""",
             "question": "What year was 'Pride and Prejudice' published?",
-            "answer": {
-                "answer": "The answer to given question is not present in context",
-                "verdict": "-1",
-            },
+            "answer": AnswerFormat.parse_obj(
+                {
+                    "answer": "The answer to given question is not present in context",
+                    "verdict": "-1",
+                }
+            ).dict(),
         },
     ],
     input_keys=["context", "question"],
@@ -201,7 +214,6 @@ keyphrase_extraction_prompt = Prompt(
     output_type="json",
 )
 
-
 seed_question_prompt = Prompt(
     name="seed_question",
     instruction="Generate a question that can be fully answered from given context. The question should be formed using topic",
@@ -226,6 +238,7 @@ seed_question_prompt = Prompt(
     output_key="question",
     output_type="str",
 )
+
 
 main_topic_extraction_prompt = Prompt(
     name="main_topic_extraction",
@@ -481,3 +494,20 @@ evolution_elimination_prompt = Prompt(
     output_type="json",
     language="english",
 )
+
+testset_prompts = [
+    reasoning_question_prompt,
+    multi_context_question_prompt,
+    conditional_question_prompt,
+    compress_question_prompt,
+    conversational_question_prompt,
+    question_answer_prompt,
+    keyphrase_extraction_prompt,
+    seed_question_prompt,
+    main_topic_extraction_prompt,
+    find_relevant_context_prompt,
+    question_rewrite_prompt,
+    context_scoring_prompt,
+    filter_question_prompt,
+    evolution_elimination_prompt,
+]
