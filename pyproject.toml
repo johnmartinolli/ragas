@@ -20,6 +20,12 @@ all = [
     "sentence-transformers",
 ]
 
+[tool.poetry]
+name = "ragas"
+version = "0.1.7"
+description = ""
+authors = []
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 
